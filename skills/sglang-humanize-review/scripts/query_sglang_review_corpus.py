@@ -10,9 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 DEFAULT_CORPUS = (
-    Path(__file__).resolve().parents[1]
-    / "references"
-    / "sglang-review-corpus-2024-2025.jsonl.gz"
+    Path(__file__).resolve().parents[1] / "references" / "sglang-review-corpus.jsonl.gz"
 )
 
 

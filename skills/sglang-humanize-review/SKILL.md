@@ -1,6 +1,6 @@
 ---
 name: sglang-humanize-review
-description: "Perform SGLang code review in the style of human maintainers by consulting the full non-agent PR review episode corpus from project start through 2025-12-31, including inline review threads, top-level PR comments, review submissions, original multilingual text, and multi-round discussions. Use when reviewing SGLang PRs, diffs, patches, or local changes for correctness, tests, performance, GPU/runtime risks, API compatibility, and maintainability."
+description: "Perform SGLang code review in the style of human maintainers by consulting the full non-agent PR review episode corpus from project start through the latest refresh (June 2026), including inline review threads, top-level PR comments, review submissions, original multilingual text, and multi-round discussions. Use when reviewing SGLang PRs, diffs, patches, or local changes for correctness, tests, performance, GPU/runtime risks, API compatibility, and maintainability."
 ---
 
 # SGLang Humanize Review
@@ -11,9 +11,11 @@ Use this skill when the user asks for a human-style SGLang code review or wants
 review feedback that resembles SGLang maintainers instead of generic linting.
 
 The bundled corpus is collected from `sgl-project/sglang` PRs from the first
-public PR through 2025-12-31, excluding PRs authored by bots or obvious
-coding-agent accounts. It is organized as review episodes, not just individual
-comments:
+public PR through the latest refresh (June 2026), excluding PRs authored by bots
+or obvious coding-agent accounts. The collector paginates every PR's full
+conversation and review history, so long multi-round discussions are captured in
+their entirety rather than truncated at the first 100 events. It is organized as
+review episodes, not just individual comments:
 
 - `inline_review_thread`: file/path-specific GitHub pull-review comments with
   `diff_hunk` context and replies grouped by thread.
@@ -52,16 +54,18 @@ python3 skills/sglang-humanize-review/scripts/query_sglang_review_corpus.py \
 The full corpus is:
 
 ```text
-references/sglang-review-corpus-2024-2025.jsonl.gz
+references/sglang-review-corpus.jsonl.gz
 ```
 
-Regenerate it only when the user asks to refresh the evidence:
+Regenerate it only when the user asks to refresh the evidence (bump `--end-year`
+to the current year; the collector caps the event window at "now" and paginates
+each PR's full conversation/review history):
 
 ```bash
 python3 skills/sglang-humanize-review/scripts/collect_sglang_review_corpus.py \
   --repo sgl-project/sglang \
   --from-beginning \
-  --end-year 2025 \
+  --end-year 2026 \
   --out-dir skills/sglang-humanize-review/references
 ```
 
@@ -113,8 +117,8 @@ python3 skills/sglang-humanize-review/scripts/collect_sglang_review_corpus.py \
 
 ## SGLang Review Heuristics From The Corpus
 
-Prioritize these risks because they recur heavily in the 2024-2025 human review
-threads:
+Prioritize these risks because they recur heavily across the human review
+threads in the corpus:
 
 - **Model and quantization behavior**: model config drift, tokenizer assumptions,
   FP8/INT4 quantization paths, MoE routing, speculative decoding, and attention

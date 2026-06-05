@@ -9,7 +9,6 @@ import http.client
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -21,7 +20,8 @@ from typing import Any
 
 API_ROOT = "https://api.github.com"
 DEFAULT_REPO = "sgl-project/sglang"
-DEFAULT_OUT_NAME = "sglang-review-corpus-2024-2025.jsonl.gz"
+DEFAULT_OUT_NAME = "sglang-review-corpus.jsonl.gz"
+DEFAULT_METADATA_NAME = "sglang-review-corpus.metadata.json"
 
 AGENT_LOGIN_PATTERNS = [
     r"\[bot\]$",
@@ -223,6 +223,7 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1] / "references",
     )
     parser.add_argument("--out-name", default=DEFAULT_OUT_NAME)
+    parser.add_argument("--metadata-name", default=DEFAULT_METADATA_NAME)
     parser.add_argument(
         "--include-agent-reviewers",
         action="store_true",
@@ -315,21 +316,47 @@ def is_agent_user(user: dict[str, Any] | None) -> bool:
     return any(re.search(pattern, login) for pattern in AGENT_LOGIN_PATTERNS)
 
 
+_ACTIVE_TOKEN: str | None = None
+
+
+def set_active_token(token: str | None) -> None:
+    global _ACTIVE_TOKEN
+    _ACTIVE_TOKEN = token
+
+
+def refresh_active_token(stale: str | None) -> str | None:
+    """Re-read the GitHub token from the gh CLI after a 401.
+
+    Long collection runs can outlive a rotated OAuth token; pulling a fresh one
+    from `gh auth token` lets the run continue instead of dying mid-stream.
+    """
+    new = gh_token_from_cli()
+    if new and new != stale:
+        set_active_token(new)
+        print("refreshed GitHub token from gh after 401", file=sys.stderr)
+        return new
+    return None
+
+
 def api_get(
-    url: str, token: str | None, retry_count: int = 8
+    url: str, token: str | None, retry_count: int = 12
 ) -> tuple[Any, dict[str, str]]:
     if not url.startswith("http"):
         url = f"{API_ROOT}{url}"
 
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "sglang-humanize-review-corpus",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    token = _ACTIVE_TOKEN or token
 
-    request = urllib.request.Request(url, headers=headers)
+    def build_request() -> urllib.request.Request:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "sglang-humanize-review-corpus",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return urllib.request.Request(url, headers=headers)
+
+    request = build_request()
     for attempt in range(retry_count):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -345,20 +372,23 @@ def api_get(
                 print(f"rate limited; sleeping {sleep_s}s", file=sys.stderr)
                 time.sleep(sleep_s)
                 continue
+            if exc.code in {401, 403} and attempt + 1 < retry_count:
+                new = refresh_active_token(token)
+                if new:
+                    token = new
+                    request = build_request()
+                    continue
             if exc.code >= 500 and attempt + 1 < retry_count:
                 time.sleep(2**attempt)
                 continue
             raise
-        except (
-            http.client.IncompleteRead,
-            http.client.RemoteDisconnected,
-            TimeoutError,
-            socket.timeout,
-            urllib.error.URLError,
-        ):
+        except (http.client.HTTPException, OSError):
+            # OSError covers ConnectionResetError / BrokenPipe / socket timeouts;
+            # HTTPException covers IncompleteRead / RemoteDisconnected. urllib does
+            # not always wrap these in URLError, so catch them directly.
             if attempt + 1 >= retry_count:
                 raise
-            time.sleep(2**attempt)
+            time.sleep(min(2**attempt, 60))
     raise RuntimeError(f"failed to fetch {url}")
 
 
@@ -366,23 +396,28 @@ def api_graphql(
     query: str,
     variables: dict[str, Any],
     token: str | None,
-    retry_count: int = 8,
+    retry_count: int = 12,
 ) -> tuple[Any, dict[str, str]]:
+    token = _ACTIVE_TOKEN or token
     if not token:
         raise RuntimeError("GraphQL review collection requires a GitHub token")
 
     payload = json.dumps(
         {"query": query, "variables": variables}, ensure_ascii=False
     ).encode("utf-8")
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "sglang-humanize-review-corpus",
-    }
-    request = urllib.request.Request(
-        f"{API_ROOT}/graphql", data=payload, headers=headers, method="POST"
-    )
+
+    def build_request() -> urllib.request.Request:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "sglang-humanize-review-corpus",
+        }
+        return urllib.request.Request(
+            f"{API_ROOT}/graphql", data=payload, headers=headers, method="POST"
+        )
+
+    request = build_request()
 
     for attempt in range(retry_count):
         try:
@@ -399,21 +434,22 @@ def api_graphql(
                 print(f"graphql rate limited; sleeping {sleep_s}s", file=sys.stderr)
                 time.sleep(sleep_s)
                 continue
+            if exc.code in {401, 403} and attempt + 1 < retry_count:
+                new = refresh_active_token(token)
+                if new:
+                    token = new
+                    request = build_request()
+                    continue
             if exc.code >= 500 and attempt + 1 < retry_count:
                 time.sleep(2**attempt)
                 continue
             raise
-        except (
-            http.client.IncompleteRead,
-            http.client.RemoteDisconnected,
-            TimeoutError,
-            socket.timeout,
-            urllib.error.URLError,
-            RuntimeError,
-        ):
+        except (http.client.HTTPException, OSError, RuntimeError):
+            # See api_get: catch raw connection errors plus GraphQL-error
+            # RuntimeErrors so transient blips back off and retry.
             if attempt + 1 >= retry_count:
                 raise
-            time.sleep(2**attempt)
+            time.sleep(min(2**attempt, 60))
     raise RuntimeError("failed to fetch GitHub GraphQL data")
 
 
@@ -648,6 +684,7 @@ def fetch_review_threads(
     include_agent_reviewers: bool,
     end_dt: dt.datetime,
     max_pages: int | None,
+    window_label: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     encoded = urllib.parse.quote(repo, safe="/")
     url = (
@@ -700,7 +737,7 @@ def fetch_review_threads(
                     "row_type": "inline_review_thread",
                     "source": {
                         "repo": repo,
-                        "years": "2024-2025",
+                        "years": window_label,
                         "collection": "github_pull_review_comments",
                     },
                     "thread_id": root_id,
@@ -772,6 +809,58 @@ query($ids: [ID!]!) {
 """
 
 
+PR_CONVERSATIONS_PAGE_QUERY = """
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      number
+      comments(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          databaseId
+          id
+          body
+          createdAt
+          updatedAt
+          url
+          authorAssociation
+          author {
+            login
+            __typename
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def fetch_remaining_connection_nodes(
+    node_id: str,
+    after_cursor: str | None,
+    query: str,
+    connection: str,
+    token: str | None,
+) -> list[dict[str, Any]]:
+    """Page through a PullRequest sub-connection beyond the first GraphQL page."""
+    collected: list[dict[str, Any]] = []
+    cursor = after_cursor
+    while cursor:
+        data, _headers = api_graphql(query, {"id": node_id, "after": cursor}, token)
+        node = data.get("node") or {}
+        conn = node.get(connection) or {}
+        collected.extend(conn.get("nodes") or [])
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+    return collected
+
+
 def fetch_pr_conversations(
     repo: str,
     token: str | None,
@@ -780,6 +869,7 @@ def fetch_pr_conversations(
     end_dt: dt.datetime,
     batch_size: int,
     max_batches: int | None,
+    window_label: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if batch_size <= 0:
         raise ValueError("--graphql-batch-size must be positive")
@@ -788,6 +878,49 @@ def fetch_pr_conversations(
     by_number = {pull["number"]: pull for pull in pulls}
     by_pr: dict[int, dict[str, Any]] = {}
     stats = collections.Counter()
+
+    def ingest(comment: dict[str, Any], pr_number: int, pull: dict[str, Any]) -> None:
+        compact = compact_graphql_conversation_comment(comment)
+        created_at = compact.get("created_at")
+        if created_at and parse_github_dt(created_at) > end_dt:
+            stats["pr_conversation_comments_after_window_skipped"] += 1
+            return
+
+        if compact["author"]["is_agent"]:
+            stats["agent_pr_conversation_comments_on_target_prs"] += 1
+            if not include_agent_reviewers:
+                return
+        else:
+            stats["human_pr_conversation_comments_on_target_prs"] += 1
+
+        thread = by_pr.get(pr_number)
+        if thread is None:
+            thread = {
+                "schema_version": 2,
+                "row_type": "pr_conversation",
+                "source": {
+                    "repo": repo,
+                    "years": window_label,
+                    "collection": "github_pr_issue_comments",
+                },
+                "thread_id": f"pr-conversation-{pr_number}",
+                "pull_request": pull,
+                "path": "",
+                "code_language": "conversation",
+                "diff_hunk": "",
+                "commit_id": None,
+                "original_commit_id": None,
+                "line": None,
+                "original_line": None,
+                "start_line": None,
+                "original_start_line": None,
+                "side": None,
+                "subject_type": "pull_request",
+                "comments": [],
+            }
+            by_pr[pr_number] = thread
+
+        thread["comments"].append(compact)
 
     for batch_index, start in enumerate(range(0, len(pulls), batch_size), start=1):
         if max_batches is not None and batch_index > max_batches:
@@ -814,51 +947,21 @@ def fetch_pr_conversations(
             stats["all_pr_conversation_comments_seen"] += (
                 comments.get("totalCount") or 0
             )
-            if (comments.get("pageInfo") or {}).get("hasNextPage"):
-                stats["pr_conversation_truncated_prs"] += 1
 
             for comment in comments.get("nodes") or []:
-                compact = compact_graphql_conversation_comment(comment)
-                created_at = compact.get("created_at")
-                if created_at and parse_github_dt(created_at) > end_dt:
-                    stats["pr_conversation_comments_after_window_skipped"] += 1
-                    continue
+                ingest(comment, pr_number, pull)
 
-                if compact["author"]["is_agent"]:
-                    stats["agent_pr_conversation_comments_on_target_prs"] += 1
-                    if not include_agent_reviewers:
-                        continue
-                else:
-                    stats["human_pr_conversation_comments_on_target_prs"] += 1
-
-                thread = by_pr.get(pr_number)
-                if thread is None:
-                    thread = {
-                        "schema_version": 2,
-                        "row_type": "pr_conversation",
-                        "source": {
-                            "repo": repo,
-                            "years": "2024-2025",
-                            "collection": "github_pr_issue_comments",
-                        },
-                        "thread_id": f"pr-conversation-{pr_number}",
-                        "pull_request": pull,
-                        "path": "",
-                        "code_language": "conversation",
-                        "diff_hunk": "",
-                        "commit_id": None,
-                        "original_commit_id": None,
-                        "line": None,
-                        "original_line": None,
-                        "start_line": None,
-                        "original_start_line": None,
-                        "side": None,
-                        "subject_type": "pull_request",
-                        "comments": [],
-                    }
-                    by_pr[pr_number] = thread
-
-                thread["comments"].append(compact)
+            page_info = comments.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                stats["pr_conversation_paginated_prs"] += 1
+                for comment in fetch_remaining_connection_nodes(
+                    pull["node_id"],
+                    page_info.get("endCursor"),
+                    PR_CONVERSATIONS_PAGE_QUERY,
+                    "comments",
+                    token,
+                ):
+                    ingest(comment, pr_number, pull)
 
     threads = finalize_threads(list(by_pr.values()))
     threads.sort(
@@ -908,6 +1011,41 @@ query($ids: [ID!]!) {
 """
 
 
+REVIEW_SUBMISSIONS_PAGE_QUERY = """
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      number
+      reviews(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          databaseId
+          id
+          state
+          body
+          submittedAt
+          createdAt
+          updatedAt
+          url
+          authorAssociation
+          commit {
+            oid
+          }
+          author {
+            login
+            __typename
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def fetch_review_submissions(
     repo: str,
     token: str | None,
@@ -916,6 +1054,7 @@ def fetch_review_submissions(
     end_dt: dt.datetime,
     batch_size: int,
     max_batches: int | None,
+    window_label: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if batch_size <= 0:
         raise ValueError("--graphql-batch-size must be positive")
@@ -924,6 +1063,55 @@ def fetch_review_submissions(
     by_number = {pull["number"]: pull for pull in pulls}
     by_pr: dict[int, dict[str, Any]] = {}
     stats = collections.Counter()
+
+    def ingest(review: dict[str, Any], pr_number: int, pull: dict[str, Any]) -> None:
+        compact = compact_review_submission(review)
+        created_at = compact.get("created_at")
+        if created_at and parse_github_dt(created_at) > end_dt:
+            stats["review_submissions_after_window_skipped"] += 1
+            return
+        body = compact.get("body") or ""
+        if not body.strip() and compact.get("state") not in {
+            "REQUEST_CHANGES",
+            "CHANGES_REQUESTED",
+        }:
+            stats["empty_review_submissions_skipped"] += 1
+            return
+        if compact["author"]["is_agent"]:
+            stats["agent_review_submissions_on_target_prs"] += 1
+            if not include_agent_reviewers:
+                return
+        else:
+            stats["human_review_submissions_on_target_prs"] += 1
+
+        thread = by_pr.get(pr_number)
+        if thread is None:
+            thread = {
+                "schema_version": 2,
+                "row_type": "review_submission",
+                "source": {
+                    "repo": repo,
+                    "years": window_label,
+                    "collection": "github_pull_request_reviews",
+                },
+                "thread_id": f"review-submissions-{pr_number}",
+                "pull_request": pull,
+                "path": "",
+                "code_language": "review",
+                "diff_hunk": "",
+                "commit_id": None,
+                "original_commit_id": None,
+                "line": None,
+                "original_line": None,
+                "start_line": None,
+                "original_start_line": None,
+                "side": None,
+                "subject_type": "pull_request_review",
+                "comments": [],
+            }
+            by_pr[pr_number] = thread
+
+        thread["comments"].append(compact)
 
     for batch_index, start in enumerate(range(0, len(pulls), batch_size), start=1):
         if max_batches is not None and batch_index > max_batches:
@@ -948,57 +1136,21 @@ def fetch_review_submissions(
             pull = by_number[pr_number]
             reviews = node.get("reviews") or {}
             stats["all_review_submissions_seen"] += reviews.get("totalCount") or 0
-            if (reviews.get("pageInfo") or {}).get("hasNextPage"):
-                stats["review_submission_truncated_prs"] += 1
 
             for review in reviews.get("nodes") or []:
-                compact = compact_review_submission(review)
-                created_at = compact.get("created_at")
-                if created_at and parse_github_dt(created_at) > end_dt:
-                    stats["review_submissions_after_window_skipped"] += 1
-                    continue
-                body = compact.get("body") or ""
-                if not body.strip() and compact.get("state") not in {
-                    "REQUEST_CHANGES",
-                    "CHANGES_REQUESTED",
-                }:
-                    stats["empty_review_submissions_skipped"] += 1
-                    continue
-                if compact["author"]["is_agent"]:
-                    stats["agent_review_submissions_on_target_prs"] += 1
-                    if not include_agent_reviewers:
-                        continue
-                else:
-                    stats["human_review_submissions_on_target_prs"] += 1
+                ingest(review, pr_number, pull)
 
-                thread = by_pr.get(pr_number)
-                if thread is None:
-                    thread = {
-                        "schema_version": 2,
-                        "row_type": "review_submission",
-                        "source": {
-                            "repo": repo,
-                            "years": "2024-2025",
-                            "collection": "github_pull_request_reviews",
-                        },
-                        "thread_id": f"review-submissions-{pr_number}",
-                        "pull_request": pull,
-                        "path": "",
-                        "code_language": "review",
-                        "diff_hunk": "",
-                        "commit_id": None,
-                        "original_commit_id": None,
-                        "line": None,
-                        "original_line": None,
-                        "start_line": None,
-                        "original_start_line": None,
-                        "side": None,
-                        "subject_type": "pull_request_review",
-                        "comments": [],
-                    }
-                    by_pr[pr_number] = thread
-
-                thread["comments"].append(compact)
+            page_info = reviews.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                stats["review_submission_paginated_prs"] += 1
+                for review in fetch_remaining_connection_nodes(
+                    pull["node_id"],
+                    page_info.get("endCursor"),
+                    REVIEW_SUBMISSIONS_PAGE_QUERY,
+                    "reviews",
+                    token,
+                ):
+                    ingest(review, pr_number, pull)
 
     threads = finalize_threads(list(by_pr.values()))
     threads.sort(
@@ -1171,10 +1323,12 @@ def write_summary_markdown(
 
 def main() -> int:
     args = parse_args()
-    token = args.token or gh_token_from_cli()
+    # Prefer a freshly-read gh token: long runs can outlive a stale env snapshot.
+    token = gh_token_from_cli() or args.token
     if not token:
         print("error: provide GITHUB_TOKEN or authenticate gh", file=sys.stderr)
         return 2
+    set_active_token(token)
 
     start_dt = (
         dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
@@ -1182,6 +1336,13 @@ def main() -> int:
         else dt.datetime(args.start_year, 1, 1, tzinfo=dt.timezone.utc)
     )
     end_dt = dt.datetime(args.end_year, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc)
+    # Never collect events from the future; cap the window at "now".
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    if end_dt > now_dt:
+        end_dt = now_dt
+    window_label = (
+        f"{start_dt.year if not args.from_beginning else 'start'}-{end_dt.year}"
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -1209,6 +1370,7 @@ def main() -> int:
             args.include_agent_reviewers,
             end_dt,
             args.max_comment_pages,
+            window_label,
         )
         all_threads.extend(inline_threads)
         combined_comment_stats.update(prefixed_stats("inline", inline_stats))
@@ -1223,6 +1385,7 @@ def main() -> int:
             end_dt,
             args.graphql_batch_size,
             args.max_issue_comment_pages,
+            window_label,
         )
         all_threads.extend(conversation_threads)
         combined_comment_stats.update(
@@ -1239,6 +1402,7 @@ def main() -> int:
             end_dt,
             args.graphql_batch_size,
             args.max_review_submission_batches,
+            window_label,
         )
         all_threads.extend(submission_threads)
         combined_comment_stats.update(prefixed_stats("submission", submission_stats))
@@ -1252,8 +1416,17 @@ def main() -> int:
     )
 
     corpus_path = args.out_dir / args.out_name
-    metadata_path = args.out_dir / "sglang-review-corpus-2024-2025.metadata.json"
+    metadata_path = args.out_dir / args.metadata_name
     summary_path = args.out_dir / "corpus-summary.md"
+
+    summary_start_year = (
+        min((t["pull_request"]["created_at"][:4] for t in all_threads), default=None)
+        if args.from_beginning
+        else args.start_year
+    )
+    summary_start_year = (
+        int(summary_start_year) if summary_start_year else args.start_year
+    )
 
     write_jsonl_gz(corpus_path, all_threads)
     metadata = summarize(
@@ -1261,8 +1434,8 @@ def main() -> int:
         pull_stats,
         combined_comment_stats,
         args.repo,
-        args.start_year,
-        args.end_year,
+        summary_start_year,
+        end_dt.year,
         args.include_agent_reviewers,
     )
     metadata_path.write_text(
